@@ -1,0 +1,5 @@
+env/
+outputs/
+*.xlsx
+__pycache__/
+*.pdf

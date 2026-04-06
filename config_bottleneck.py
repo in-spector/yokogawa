@@ -43,7 +43,7 @@ class BottleneckConfig:
     kernel_size: int = 5
     pool_size: int = 4
     fc_hidden: int = 256
-    mlp_hidden_dims: List[int] = field(default_factory=lambda: [64, 32])
+    mlp_hidden_dims: List[int] = field(default_factory=lambda: [256, 128, 64, 32])
 
     # PLS
     pls_n_components: int = 8

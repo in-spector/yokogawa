@@ -20,6 +20,30 @@ from config import Config
 # Raw data loading
 # ---------------------------------------------------------------------------
 
+def _coerce_numeric_with_valid_mask(df: pd.DataFrame, cols):
+    """Convert selected columns to numeric and return validity mask per row."""
+    numeric_df = df.loc[:, cols].apply(pd.to_numeric, errors="coerce")
+    valid_mask = ~numeric_df.isna().any(axis=1)
+    return numeric_df, valid_mask
+
+
+def _warn_dropped_rows(
+    file_path: Path,
+    sheet_name: str,
+    dropped: int,
+    total: int,
+    context: str,
+):
+    """Emit a compact warning when rows are skipped due to parse failures."""
+    if dropped <= 0:
+        return
+    print(
+        f"[WARN] Dropped {dropped}/{total} row(s) in '{file_path}' "
+        f"(sheet='{sheet_name}', {context}) due to non-numeric values.",
+        file=sys.stderr,
+    )
+
+
 def load_raw_data(cfg: Config):
     """Load training and evaluation sheets from the Excel file.
 
@@ -28,11 +52,15 @@ def load_raw_data(cfg: Config):
     X_train : np.ndarray, shape (N_train, n_features)
     y_train : np.ndarray, shape (N_train, n_targets)
     X_eval  : np.ndarray, shape (N_eval, n_features)
+        If cfg.eval_sheet is None/empty, returns shape (0, n_features).
     wavenum : np.ndarray, wavenumber axis (for reference)
     """
     file_paths = resolve_excel_files(cfg.data_path)
     if not file_paths:
         raise FileNotFoundError(f"No xlsx files found: {cfg.data_path}")
+
+    eval_sheet = getattr(cfg, "eval_sheet", None)
+    use_eval_sheet = bool(eval_sheet)
 
     train_dfs = []
     eval_dfs = []
@@ -40,7 +68,6 @@ def load_raw_data(cfg: Config):
     for file_path in file_paths:
         try:
             train_df = pd.read_excel(file_path, sheet_name=cfg.train_sheet)
-            eval_df = pd.read_excel(file_path, sheet_name=cfg.eval_sheet)
         except Exception as exc:
             print(
                 f"[WARN] Skipped file '{file_path}': {exc}",
@@ -48,16 +75,38 @@ def load_raw_data(cfg: Config):
             )
             continue
 
+        eval_df = None
+        if use_eval_sheet:
+            try:
+                eval_df = pd.read_excel(file_path, sheet_name=eval_sheet)
+            except Exception as exc:
+                print(
+                    f"[WARN] Skipped file '{file_path}': {exc}",
+                    file=sys.stderr,
+                )
+                continue
+
         # Identify spectral columns (numeric column names = wavenumbers)
         spec_cols = [c for c in train_df.columns if isinstance(c, (int, float))]
-        # Use only the wavenumber columns present in BOTH sheets
-        common_cols = [c for c in spec_cols if c in eval_df.columns]
+        # Use train-only spectral columns when eval sheet is disabled.
+        # Otherwise, keep only columns common to both train/eval sheets.
+        if use_eval_sheet and eval_df is not None:
+            common_cols = [c for c in spec_cols if c in eval_df.columns]
+        else:
+            common_cols = spec_cols
         if not common_cols:
-            print(
-                f"[WARN] Skipped file '{file_path}': no common spectral columns "
-                f"between '{cfg.train_sheet}' and '{cfg.eval_sheet}'",
-                file=sys.stderr,
-            )
+            if use_eval_sheet:
+                print(
+                    f"[WARN] Skipped file '{file_path}': no common spectral columns "
+                    f"between '{cfg.train_sheet}' and '{eval_sheet}'",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[WARN] Skipped file '{file_path}': no spectral columns in "
+                    f"'{cfg.train_sheet}'",
+                    file=sys.stderr,
+                )
             continue
 
         if common_cols_all is None:
@@ -65,13 +114,18 @@ def load_raw_data(cfg: Config):
         else:
             common_cols_all &= set(common_cols)
 
-        train_dfs.append(train_df)
-        eval_dfs.append(eval_df)
+        train_dfs.append((file_path, train_df))
+        if eval_df is not None:
+            eval_dfs.append((file_path, eval_df))
 
-    if not train_dfs or not eval_dfs:
+    if not train_dfs:
         raise RuntimeError(
             "No valid Excel files found. "
-            f"Check sheet names: train='{cfg.train_sheet}', eval='{cfg.eval_sheet}'."
+            + (
+                f"Check sheet names: train='{cfg.train_sheet}', eval='{eval_sheet}'."
+                if use_eval_sheet
+                else f"Check train sheet name: train='{cfg.train_sheet}'."
+            )
         )
     if not common_cols_all:
         raise RuntimeError("No common spectral columns across all valid files.")
@@ -79,24 +133,56 @@ def load_raw_data(cfg: Config):
     common_cols_sorted = sorted(common_cols_all, reverse=True)  # high wavenumber first
     wavenum = np.array(common_cols_sorted)
 
-    try:
-        X_train = np.concatenate(
-            [df[common_cols_sorted].values.astype(np.float32) for df in train_dfs],
-            axis=0,
-        )
-        y_train = np.concatenate(
-            [df[cfg.target_cols].values.astype(np.float32) for df in train_dfs],
-            axis=0,
-        )
-    except KeyError as exc:
-        raise KeyError(
-            f"Target column(s) missing in train sheet. target_cols={cfg.target_cols}"
-        ) from exc
+    X_train_parts = []
+    y_train_parts = []
+    for file_path, df in train_dfs:
+        try:
+            spec_num, spec_valid = _coerce_numeric_with_valid_mask(df, common_cols_sorted)
+            y_num, y_valid = _coerce_numeric_with_valid_mask(df, cfg.target_cols)
+        except KeyError as exc:
+            raise KeyError(
+                f"Target column(s) missing in train sheet. target_cols={cfg.target_cols}"
+            ) from exc
 
-    X_eval = np.concatenate(
-        [df[common_cols_sorted].values.astype(np.float32) for df in eval_dfs],
-        axis=0,
-    )
+        valid = spec_valid & y_valid
+        _warn_dropped_rows(
+            file_path,
+            cfg.train_sheet,
+            dropped=int((~valid).sum()),
+            total=int(df.shape[0]),
+            context="train spectral/target parsing",
+        )
+        if bool(valid.any()):
+            X_train_parts.append(spec_num.loc[valid].to_numpy(dtype=np.float32))
+            y_train_parts.append(y_num.loc[valid].to_numpy(dtype=np.float32))
+
+    if not X_train_parts:
+        raise RuntimeError(
+            "No valid numeric training rows remain after parsing spectral/target values."
+        )
+
+    X_train = np.concatenate(X_train_parts, axis=0)
+    y_train = np.concatenate(y_train_parts, axis=0)
+
+    if use_eval_sheet and eval_dfs:
+        X_eval_parts = []
+        for file_path, df in eval_dfs:
+            spec_num, valid = _coerce_numeric_with_valid_mask(df, common_cols_sorted)
+            _warn_dropped_rows(
+                file_path,
+                eval_sheet,
+                dropped=int((~valid).sum()),
+                total=int(df.shape[0]),
+                context="eval spectral parsing",
+            )
+            if bool(valid.any()):
+                X_eval_parts.append(spec_num.loc[valid].to_numpy(dtype=np.float32))
+        if X_eval_parts:
+            X_eval = np.concatenate(X_eval_parts, axis=0)
+        else:
+            X_eval = np.empty((0, len(common_cols_sorted)), dtype=np.float32)
+    else:
+        X_eval = np.empty((0, len(common_cols_sorted)), dtype=np.float32)
 
     return X_train, y_train, X_eval, wavenum
 
@@ -123,19 +209,50 @@ def resolve_excel_files(data_path: Union[str, Sequence[str]]):
 
 def load_eval_sample_ids(cfg: Config) -> np.ndarray:
     """Load evaluation sample IDs in the same file order as `load_raw_data`."""
+    eval_sheet = getattr(cfg, "eval_sheet", None)
+    if not eval_sheet:
+        return np.array([], dtype=str)
+
     file_paths = resolve_excel_files(cfg.data_path)
-    ids = []
+    eval_dfs = []
+    common_cols_all = None
     for file_path in file_paths:
         try:
-            eval_df = pd.read_excel(file_path, sheet_name=cfg.eval_sheet)
+            train_df = pd.read_excel(file_path, sheet_name=cfg.train_sheet)
+            eval_df = pd.read_excel(file_path, sheet_name=eval_sheet)
         except Exception as exc:
             print(
                 f"[WARN] Skipped file '{file_path}' while loading eval IDs: {exc}",
                 file=sys.stderr,
             )
             continue
+
+        spec_cols = [c for c in train_df.columns if isinstance(c, (int, float))]
+        common_cols = [c for c in spec_cols if c in eval_df.columns]
+        if not common_cols:
+            continue
+        if common_cols_all is None:
+            common_cols_all = set(common_cols)
+        else:
+            common_cols_all &= set(common_cols)
+        eval_dfs.append((file_path, eval_df))
+
+    if not eval_dfs or not common_cols_all:
+        return np.array([], dtype=str)
+
+    common_cols_sorted = sorted(common_cols_all, reverse=True)
+    ids = []
+    for file_path, eval_df in eval_dfs:
+        _, valid = _coerce_numeric_with_valid_mask(eval_df, common_cols_sorted)
+        _warn_dropped_rows(
+            file_path,
+            eval_sheet,
+            dropped=int((~valid).sum()),
+            total=int(eval_df.shape[0]),
+            context="eval spectral parsing for IDs",
+        )
         id_col = eval_df.columns[0]  # first column is sample ID
-        file_ids = eval_df[id_col].astype(str)
+        file_ids = eval_df.loc[valid, id_col].astype(str)
         if len(file_paths) == 1:
             ids.extend(file_ids.tolist())
         else:
@@ -203,9 +320,9 @@ def load_reconstruction_raw_data(cfg: Config):
         else:
             common_cols_all &= set(common_cols)
 
-        train_dfs.append(train_df)
+        train_dfs.append((file_path, train_df))
         if eval_df is not None:
-            eval_dfs.append(eval_df)
+            eval_dfs.append((file_path, eval_df))
 
     if not train_dfs:
         if use_eval_sheet:
@@ -223,15 +340,39 @@ def load_reconstruction_raw_data(cfg: Config):
     common_cols_sorted = sorted(common_cols_all, reverse=True)
     wavenum = np.array(common_cols_sorted)
 
-    X_train = np.concatenate(
-        [df[common_cols_sorted].values.astype(np.float32) for df in train_dfs],
-        axis=0,
-    )
-    if use_eval_sheet and eval_dfs:
-        X_eval = np.concatenate(
-            [df[common_cols_sorted].values.astype(np.float32) for df in eval_dfs],
-            axis=0,
+    X_train_parts = []
+    for file_path, df in train_dfs:
+        spec_num, valid = _coerce_numeric_with_valid_mask(df, common_cols_sorted)
+        _warn_dropped_rows(
+            file_path,
+            cfg.train_sheet,
+            dropped=int((~valid).sum()),
+            total=int(df.shape[0]),
+            context="reconstruction train spectral parsing",
         )
+        if bool(valid.any()):
+            X_train_parts.append(spec_num.loc[valid].to_numpy(dtype=np.float32))
+    if not X_train_parts:
+        raise RuntimeError("No valid numeric train rows remain for reconstruction.")
+    X_train = np.concatenate(X_train_parts, axis=0)
+
+    if use_eval_sheet and eval_dfs:
+        X_eval_parts = []
+        for file_path, df in eval_dfs:
+            spec_num, valid = _coerce_numeric_with_valid_mask(df, common_cols_sorted)
+            _warn_dropped_rows(
+                file_path,
+                eval_sheet,
+                dropped=int((~valid).sum()),
+                total=int(df.shape[0]),
+                context="reconstruction eval spectral parsing",
+            )
+            if bool(valid.any()):
+                X_eval_parts.append(spec_num.loc[valid].to_numpy(dtype=np.float32))
+        if X_eval_parts:
+            X_eval = np.concatenate(X_eval_parts, axis=0)
+        else:
+            X_eval = np.empty((0, len(common_cols_sorted)), dtype=np.float32)
     else:
         X_eval = np.empty((0, len(common_cols_sorted)), dtype=np.float32)
     return X_train, X_eval, wavenum
@@ -241,20 +382,94 @@ def load_reconstruction_raw_data(cfg: Config):
 # Preprocessing
 # ---------------------------------------------------------------------------
 
-def preprocess(X_train, X_eval, cfg: Config):
-    """Apply Savitzky-Golay smoothing + standardization.
+def apply_savgol_to_base_spectra(
+    X_train: np.ndarray,
+    X_eval: np.ndarray,
+    cfg: Config,
+):
+    """Apply optional Savitzky-Golay transform on base spectra only."""
+    sg_window = getattr(cfg, "sg_window", None)
+    if sg_window is None:
+        return X_train, X_eval
+
+    sg_window = int(sg_window)
+    if sg_window <= 1:
+        return X_train, X_eval
+
+    sg_polyorder = int(getattr(cfg, "sg_polyorder", 2))
+    sg_deriv = int(getattr(cfg, "sg_deriv", 0))
+
+    if sg_window % 2 == 0:
+        raise ValueError("sg_window must be an odd integer greater than 1.")
+    if sg_polyorder < 0:
+        raise ValueError("sg_polyorder must be >= 0.")
+    if sg_polyorder >= sg_window:
+        raise ValueError("sg_polyorder must be smaller than sg_window.")
+    if sg_deriv not in {0, 1, 2}:
+        raise ValueError("sg_deriv must be one of {0, 1, 2}.")
+    if sg_deriv > sg_polyorder:
+        raise ValueError("sg_deriv must be <= sg_polyorder.")
+    # mode='interp' requires window_length <= size of x along the target axis.
+    if sg_window > X_train.shape[1]:
+        raise ValueError(
+            "sg_window must be <= number of spectral channels. "
+            f"got sg_window={sg_window}, channels={X_train.shape[1]}"
+        )
+
+    # SG is applied along wavelength axis per spectrum row.
+    X_train_out = savgol_filter(
+        X_train,
+        window_length=sg_window,
+        polyorder=sg_polyorder,
+        deriv=sg_deriv,
+        axis=1,
+        mode="interp",
+    ).astype(np.float32)
+
+    # SciPy's internal least-squares path can fail on empty sample batches.
+    # Keep empty eval arrays untouched and consistent in shape/dtype.
+    if X_eval.shape[0] == 0:
+        X_eval_out = np.empty((0, X_train.shape[1]), dtype=np.float32)
+        return X_train_out, X_eval_out
+
+    if sg_window > X_eval.shape[1]:
+        raise ValueError(
+            "sg_window must be <= number of eval spectral channels. "
+            f"got sg_window={sg_window}, channels={X_eval.shape[1]}"
+        )
+
+    X_eval_out = savgol_filter(
+        X_eval,
+        window_length=sg_window,
+        polyorder=sg_polyorder,
+        deriv=sg_deriv,
+        axis=1,
+        mode="interp",
+    ).astype(np.float32)
+    return X_train_out, X_eval_out
+
+
+def preprocess(
+    X_train,
+    X_eval,
+    cfg: Config,
+    apply_savgol: bool = True,
+):
+    """Apply feature standardization with optional SG transform.
 
     Returns scaled arrays and the fitted StandardScaler (for inverse transform).
     """
-    # Savitzky-Golay smoothing along the wavelength axis
-    if cfg.sg_window and cfg.sg_window > 1:
-        X_train = savgol_filter(X_train, cfg.sg_window, cfg.sg_polyorder, axis=1)
-        X_eval = savgol_filter(X_eval, cfg.sg_window, cfg.sg_polyorder, axis=1)
+    if apply_savgol:
+        X_train, X_eval = apply_savgol_to_base_spectra(X_train, X_eval, cfg)
 
-    # Standardize each wavelength channel
+    # Standardize each feature channel
     scaler_X = StandardScaler()
     X_train = scaler_X.fit_transform(X_train).astype(np.float32)
-    X_eval = scaler_X.transform(X_eval).astype(np.float32)
+    if X_eval.shape[0] == 0:
+        # Keep empty eval array when eval sheet is disabled (e.g., eval_sheet=None).
+        X_eval = np.empty((0, X_train.shape[1]), dtype=np.float32)
+    else:
+        X_eval = scaler_X.transform(X_eval).astype(np.float32)
 
     return X_train, X_eval, scaler_X
 
@@ -317,6 +532,7 @@ def append_derivative_features(
     feats_eval = [X_eval]
 
     if cfg.use_derivative_features or cfg.use_second_derivative_features:
+        # Derivative features are built from the already-prepared base spectra.
         dX_train = np.gradient(X_train, axis=1).astype(np.float32)
         dX_eval = np.gradient(X_eval, axis=1).astype(np.float32)
         if cfg.use_derivative_features:

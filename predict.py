@@ -15,6 +15,7 @@ from dataset import (
     load_raw_data,
     preprocess,
     apply_wavenumber_range,
+    apply_savgol_to_base_spectra,
     append_derivative_features,
     load_eval_sample_ids,
 )
@@ -32,25 +33,38 @@ def resolve_run_dir(cfg: Config) -> str:
     return cfg.output_dir
 
 
+def _build_feature_wavenumbers(cfg: Config, wavenum: np.ndarray) -> np.ndarray:
+    """Expand selected wavenumbers to match feature construction order."""
+    parts = [wavenum]
+    if cfg.use_derivative_features:
+        parts.append(wavenum)
+    if cfg.use_second_derivative_features:
+        parts.append(wavenum)
+    return np.concatenate(parts, axis=0).astype(np.float32)
+
+
 def main():
     cfg = Config()
     model_type = str(cfg.model_type).lower()
-    if model_type not in {"cnn", "cnn_dual", "mlp", "pls"}:
+    if model_type not in {"cnn", "cnn_fourier", "cnn_dual", "mlp", "transformer", "pls"}:
         raise ValueError(
             f"Unsupported model_type='{cfg.model_type}'. "
-            "Use 'cnn', 'cnn_dual', 'mlp', or 'pls'."
+            "Use 'cnn', 'cnn_fourier', 'cnn_dual', 'mlp', 'transformer', or 'pls'."
         )
     os.makedirs(cfg.output_dir, exist_ok=True)
     run_dir = resolve_run_dir(cfg)
 
     # Load and preprocess
     X_raw_all, _, X_eval_raw_all, wavenum_all = load_raw_data(cfg)
-    X_raw, X_eval_raw, _, _ = apply_wavenumber_range(
+    X_raw, X_eval_raw, _, wavenum = apply_wavenumber_range(
         X_raw_all, X_eval_raw_all, wavenum_all, cfg
     )
-    X_feat, X_eval_feat = append_derivative_features(X_raw, X_eval_raw, cfg)
-    X_train, X_eval, _ = preprocess(X_feat, X_eval_feat, cfg)
+    # Keep train/predict pipelines consistent: SG on base spectra first.
+    X_sg, X_eval_sg = apply_savgol_to_base_spectra(X_raw, X_eval_raw, cfg)
+    X_feat, X_eval_feat = append_derivative_features(X_sg, X_eval_sg, cfg)
+    X_train, X_eval, _ = preprocess(X_feat, X_eval_feat, cfg, apply_savgol=False)
     input_length = X_train.shape[1]
+    feature_wavenumbers = _build_feature_wavenumbers(cfg, wavenum)
 
     # Load checkpoint paths
     paths_file = os.path.join(run_dir, "best_checkpoints.txt")
@@ -74,7 +88,11 @@ def main():
         X_eval_t = torch.from_numpy(X_eval).unsqueeze(1)  # (N, 1, L)
         for path in ckpt_paths:
             model = SpectralRegressionModule.load_from_checkpoint(
-                path, cfg=cfg, input_length=input_length, weights_only=False
+                path,
+                cfg=cfg,
+                input_length=input_length,
+                feature_wavenumbers=feature_wavenumbers,
+                weights_only=False,
             )
             model.eval()
             with torch.no_grad():

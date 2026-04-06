@@ -19,6 +19,11 @@ from sklearn.model_selection import KFold
 
 from config_bottleneck import BottleneckConfig
 from checkpoint_utils import average_lightning_checkpoints
+from cv_utils import (
+    evaluate_ensemble_on_dataset,
+    save_all_folds_scatter_plot,
+    save_fold_scatter_plot,
+)
 from dataset import SpectrumDataModule, preprocess, resolve_excel_files
 from model import (
     SpectralMaskedModelingModule,
@@ -247,7 +252,7 @@ def train_one_fold_nn(
     rmse = [
         np.sqrt(mean_squared_error(y_val[:, i], pred[:, i])) for i in range(cfg.n_targets)
     ]
-    return best_path, r2, rmse, logger.log_dir
+    return best_path, r2, rmse, logger.log_dir, y_val, pred
 
 
 def train_one_fold_pls(
@@ -284,7 +289,7 @@ def train_one_fold_pls(
     rmse = [
         np.sqrt(mean_squared_error(y_val[:, i], pred[:, i])) for i in range(cfg.n_targets)
     ]
-    return best_path, r2, rmse, None
+    return best_path, r2, rmse, None, y_val, pred
 
 
 def main():
@@ -334,19 +339,22 @@ def main():
     print(f"Model type: {model_type}")
     print(f"Run directory: {run_dir}")
 
+    plots_dir = os.path.join(run_dir, "artifacts", "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
     kf = KFold(n_splits=cfg.n_splits, shuffle=True, random_state=cfg.seed)
-    all_r2, all_rmse, best_paths, tb_log_dirs = [], [], [], []
+    all_r2, all_rmse, best_paths, tb_log_dirs, fold_plot_results = [], [], [], [], []
 
     for fold, (tr_idx, va_idx) in enumerate(kf.split(X)):
         X_tr, X_va = X[tr_idx], X[va_idx]
         y_tr, y_va = y[tr_idx], y[va_idx]
 
         if model_type == "pls":
-            path, r2, rmse, tb_log_dir = train_one_fold_pls(
+            path, r2, rmse, tb_log_dir, y_true, y_pred = train_one_fold_pls(
                 fold, X_tr, y_tr, X_va, y_va, cfg, run_dir
             )
         else:
-            path, r2, rmse, tb_log_dir = train_one_fold_nn(
+            path, r2, rmse, tb_log_dir, y_true, y_pred = train_one_fold_nn(
                 fold, X_tr, y_tr, X_va, y_va, cfg, run_dir
             )
 
@@ -355,28 +363,60 @@ def main():
             tb_log_dirs.append(tb_log_dir)
         all_r2.append(r2)
         all_rmse.append(rmse)
+        fold_plot_results.append({"fold": fold, "y_true": y_true, "y_pred": y_pred})
+
+        fold_plot_path = os.path.join(plots_dir, f"fold_{fold + 1}_pred_vs_true.pdf")
+        save_fold_scatter_plot(y_true, y_pred, cfg.target_cols, fold, fold_plot_path)
 
         print(f"\nFold {fold + 1}/{cfg.n_splits}")
         for i, name in enumerate(cfg.target_cols):
             print(f"  {name}: R²={r2[i]:.4f}  RMSE={rmse[i]:.4f}")
 
-    summary_lines = ["Cross-validation summary (mean ± std)"]
+    summary_lines = [
+        f"{'='*60}",
+        "  Cross-validation summary (mean ± std)",
+        f"{'='*60}",
+    ]
     for i, name in enumerate(cfg.target_cols):
         r2_vals = [r[i] for r in all_r2]
         rmse_vals = [r[i] for r in all_rmse]
         summary_lines.append(
-            f"{name}: R²={np.mean(r2_vals):.4f}±{np.std(r2_vals):.4f}  "
+            f"  {name}:  R²={np.mean(r2_vals):.4f}±{np.std(r2_vals):.4f}  "
             f"RMSE={np.mean(rmse_vals):.4f}±{np.std(rmse_vals):.4f}"
         )
     print()
     for line in summary_lines:
         print(line)
 
+    full_train_r2, full_train_rmse = evaluate_ensemble_on_dataset(
+        best_paths=best_paths,
+        X_data=X,
+        y_data=y,
+        cfg=cfg,
+        model_type=model_type,
+        input_length=int(X.shape[1]),
+    )
+    full_train_lines = [
+        f"{'='*60}",
+        "  Ensemble evaluation on full training data",
+        f"{'='*60}",
+    ]
+    for i, name in enumerate(cfg.target_cols):
+        full_train_lines.append(
+            f"  {name}:  R²={full_train_r2[i]:.4f}  RMSE={full_train_rmse[i]:.4f}"
+        )
+    print()
+    for line in full_train_lines:
+        print(line)
+
     with open(os.path.join(run_dir, "best_checkpoints_bottleneck.txt"), "w") as f:
         for p in best_paths:
             f.write(p + "\n")
     with open(os.path.join(run_dir, "artifacts", "cv_summary.txt"), "w") as f:
-        f.write("\n".join(summary_lines) + "\n")
+        f.write("\n".join(summary_lines + [""] + full_train_lines) + "\n")
+
+    all_folds_plot_path = os.path.join(plots_dir, "all_folds_pred_vs_true.pdf")
+    save_all_folds_scatter_plot(fold_plot_results, cfg.target_cols, all_folds_plot_path)
 
     np.savez_compressed(
         os.path.join(run_dir, "artifacts", "bottleneck_train.npz"),
@@ -393,6 +433,8 @@ def main():
         print(f"Averaged checkpoint: {averaged_ckpt_path}")
     else:
         print("Averaged checkpoint: skipped for PLS model_type.")
+    print(f"Fold scatter plots saved to {plots_dir}")
+    print(f"Combined fold scatter plot saved to {all_folds_plot_path}")
 
     if tb_log_dirs:
         print("TensorBoard log dirs:")

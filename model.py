@@ -1,9 +1,11 @@
 """
-Spectral regression models (CNN/MLP), wrapped in a PyTorch Lightning module.
+Spectral regression models (CNN/MLP/Transformer/Fourier-CNN), wrapped in Lightning modules.
 """
 import math
+from typing import Optional
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -55,6 +57,191 @@ class ConvBlock(nn.Module):
 
     def forward(self, x):
         return self.block(x)
+
+
+class FourierSpectralConv1d(nn.Module):
+    """
+    FNO-style spectral convolution for 1D signals.
+
+    Learns channel mixing on truncated low-frequency Fourier modes.
+    """
+
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        n_modes: int,
+        softshrink_lambda: float = 0.0,
+    ):
+        super().__init__()
+        if n_modes < 1:
+            raise ValueError("n_modes must be >= 1.")
+        if softshrink_lambda < 0.0:
+            raise ValueError("softshrink_lambda must be >= 0.")
+
+        self.out_ch = int(out_ch)
+        self.n_modes = int(n_modes)
+        self.softshrink_lambda = float(softshrink_lambda)
+
+        scale = 1.0 / max(in_ch * out_ch, 1)
+        self.weight = nn.Parameter(
+            scale * torch.randn(in_ch, out_ch, self.n_modes, dtype=torch.cfloat)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, L)
+        x_ft = torch.fft.rfft(x, dim=-1, norm="ortho")  # (B, C, F)
+        n_freq = x_ft.size(-1)
+        n_modes = min(self.n_modes, n_freq)
+
+        out_ft = torch.zeros(
+            x.size(0),
+            self.out_ch,
+            n_freq,
+            dtype=x_ft.dtype,
+            device=x.device,
+        )
+        if n_modes > 0:
+            out_ft[:, :, :n_modes] = torch.einsum(
+                "bcm,com->bom",
+                x_ft[:, :, :n_modes],
+                self.weight[:, :, :n_modes],
+            )
+
+        if self.softshrink_lambda > 0.0:
+            out_ft = torch.complex(
+                F.softshrink(out_ft.real, lambd=self.softshrink_lambda),
+                F.softshrink(out_ft.imag, lambd=self.softshrink_lambda),
+            )
+
+        return torch.fft.irfft(out_ft, n=x.size(-1), dim=-1, norm="ortho")
+
+
+class FourierConvBlock1d(nn.Module):
+    """
+    Hybrid local+global block inspired by FFC:
+    - local path: standard Conv1d
+    - global path: Fourier spectral convolution
+    """
+
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        kernel_size: int,
+        pool_size: int,
+        n_modes: int,
+        dropout: float = 0.0,
+        softshrink_lambda: float = 0.0,
+    ):
+        super().__init__()
+        self.local = nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, kernel_size, padding=kernel_size // 2, bias=False),
+            nn.BatchNorm1d(out_ch),
+            nn.GELU(),
+        )
+        self.global_in = nn.Conv1d(in_ch, out_ch, kernel_size=1, bias=False)
+        self.global_fourier = FourierSpectralConv1d(
+            out_ch,
+            out_ch,
+            n_modes=n_modes,
+            softshrink_lambda=softshrink_lambda,
+        )
+        self.global_norm = nn.BatchNorm1d(out_ch)
+
+        self.fuse = nn.Sequential(
+            nn.Conv1d(out_ch * 2, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm1d(out_ch),
+            nn.GELU(),
+        )
+        self.residual_proj = (
+            nn.Identity()
+            if in_ch == out_ch
+            else nn.Conv1d(in_ch, out_ch, kernel_size=1, bias=False)
+        )
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+        self.pool = nn.MaxPool1d(pool_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h_local = self.local(x)
+        h_global = self.global_in(x)
+        h_global = self.global_fourier(h_global)
+        h_global = self.global_norm(h_global)
+
+        h = self.fuse(torch.cat([h_local, h_global], dim=1))
+        h = self.dropout(h)
+        h = h + self.residual_proj(x)
+        return self.pool(h)
+
+
+class SpectralFourierCNN(nn.Module):
+    """Hybrid Fourier-CNN for spectral regression."""
+
+    def __init__(self, cfg: Config, input_length: int):
+        super().__init__()
+        channels = [1] + list(cfg.cnn_channels)
+        kernel_size = int(cfg.kernel_size)
+        pool_size = int(cfg.pool_size)
+        softshrink_lambda = float(getattr(cfg, "fourier_softshrink_lambda", 0.0))
+        dropout = float(getattr(cfg, "dropout", 0.0))
+
+        layers = []
+        L = input_length
+        for i in range(len(channels) - 1):
+            n_modes = self._resolve_n_modes(cfg, seq_len=max(L, 1))
+            layers.append(
+                FourierConvBlock1d(
+                    channels[i],
+                    channels[i + 1],
+                    kernel_size=kernel_size,
+                    pool_size=pool_size,
+                    n_modes=n_modes,
+                    dropout=dropout,
+                    softshrink_lambda=softshrink_lambda,
+                )
+            )
+            L = L // pool_size
+
+        final_len = max(L, 1)
+        head_pool_out_len = int(getattr(cfg, "fourier_head_pool_out_len", 8))
+        if head_pool_out_len < 1:
+            raise ValueError("fourier_head_pool_out_len must be >= 1.")
+        head_pool_out_len = min(head_pool_out_len, final_len)
+
+        self.encoder = nn.Sequential(*layers)
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(head_pool_out_len),
+            nn.Flatten(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(channels[-1] * head_pool_out_len, cfg.fc_hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.fc_hidden, cfg.n_targets),
+        )
+
+    @staticmethod
+    def _resolve_n_modes(cfg: Config, seq_len: int) -> int:
+        if seq_len < 1:
+            raise ValueError("seq_len must be >= 1.")
+        n_freq = (seq_len // 2) + 1
+
+        explicit_modes = getattr(cfg, "fourier_n_modes", None)
+        min_modes = int(getattr(cfg, "fourier_min_modes", 8))
+        ratio = float(getattr(cfg, "fourier_modes_ratio", 0.25))
+        if min_modes < 1:
+            raise ValueError("fourier_min_modes must be >= 1.")
+        if ratio <= 0.0:
+            raise ValueError("fourier_modes_ratio must be > 0.")
+
+        if explicit_modes is not None:
+            n_modes = int(explicit_modes)
+        else:
+            n_modes = max(min_modes, int(round(n_freq * ratio)))
+        return max(1, min(n_modes, n_freq))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.encoder(x)
+        return self.head(h)
 
 
 class SpectralCNN(nn.Module):
@@ -198,6 +385,218 @@ class SpectralMLP(nn.Module):
         return self.net(x)
 
 
+class SpectralTransformer(nn.Module):
+    """
+    ProTformer-style spectral regressor.
+
+    Interface is kept compatible with the previous implementation:
+      - __init__(cfg, input_length, feature_wavenumbers=None)
+      - forward(x) where x is (B, 1, L) or (B, L)
+    """
+
+    def __init__(
+        self,
+        cfg,
+        input_length: int,
+        feature_wavenumbers: Optional[torch.Tensor] = None,
+    ):
+        super().__init__()
+
+        # ---- ProTformer-like defaults ----
+        patch_size = int(getattr(cfg, "transformer_patch_size", 25))
+        d_model = int(getattr(cfg, "transformer_d_model", 50))      # paper: 50-d patch embedding
+        nhead = int(getattr(cfg, "transformer_nhead", 5))           # 50 divisible by 5
+        num_layers = int(getattr(cfg, "transformer_num_layers", 3)) # paper: 3 transformer blocks
+        ffn_dim = int(getattr(cfg, "transformer_ffn_dim", 128))
+        dropout = float(getattr(cfg, "transformer_dropout", 0.1))
+
+        # Regression head dimensions close to the paper
+        head_hidden1 = int(getattr(cfg, "transformer_head_hidden", 128))
+        head_hidden2 = int(getattr(cfg, "transformer_head_hidden2", 32))
+
+        if patch_size < 1:
+            raise ValueError("transformer_patch_size must be >= 1.")
+        if d_model < 2:
+            raise ValueError("transformer_d_model must be >= 2.")
+        if d_model % nhead != 0:
+            raise ValueError(
+                "transformer_d_model must be divisible by transformer_nhead."
+            )
+        if input_length < 1:
+            raise ValueError("input_length must be >= 1.")
+
+        self.input_length = int(input_length)
+        self.patch_size = patch_size
+        self.d_model = d_model
+
+        # Number of patches after right padding
+        self.num_patches = math.ceil(self.input_length / self.patch_size)
+        self.padded_length = self.num_patches * self.patch_size
+        self.pad_length = self.padded_length - self.input_length
+
+        # Keep compatibility with previous constructor signature.
+        # If actual feature wavenumbers are given, use patch-center wavenumbers for sinusoidal PE.
+        if feature_wavenumbers is None:
+            wn = torch.arange(self.input_length, dtype=torch.float32)
+        else:
+            wn = torch.as_tensor(feature_wavenumbers, dtype=torch.float32).flatten()
+            if int(wn.numel()) != int(self.input_length):
+                raise ValueError(
+                    "feature_wavenumbers length must match input_length. "
+                    f"got {int(wn.numel())} vs {int(input_length)}"
+                )
+
+        self.register_buffer("feature_wavenumbers", wn, persistent=True)
+
+        patch_centers = self._build_patch_centers(wn, self.patch_size, self.num_patches)
+        pos_enc = self._build_wavenumber_sincos(patch_centers, d_model)
+        self.register_buffer("positional_encoding", pos_enc, persistent=True)
+
+        # Learnable CLS token and its positional embedding.
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.cls_positional = nn.Parameter(torch.zeros(1, 1, d_model))
+        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
+        nn.init.normal_(self.cls_positional, mean=0.0, std=0.02)
+
+        # ---- Patch embedding: (patch_size) -> d_model ----
+        self.patch_embed = nn.Linear(self.patch_size, d_model)
+
+        self.embed_norm = nn.LayerNorm(d_model)
+        self.embed_dropout = nn.Dropout(dropout)
+
+        # ---- Transformer blocks ----
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=ffn_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            norm=nn.LayerNorm(d_model),
+        )
+
+        # ---- Regression head: CLS token -> 128 -> 32 -> n_targets ----
+        self.head = nn.Sequential(
+            nn.Linear(d_model, head_hidden1),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden1, head_hidden2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden2, cfg.n_targets),
+        )
+
+    @staticmethod
+    def _build_patch_centers(
+        wavenumbers: torch.Tensor,
+        patch_size: int,
+        num_patches: int,
+    ) -> torch.Tensor:
+        """
+        Build one representative wavenumber per patch using the mean of each patch.
+        For the last incomplete patch, repeat the last wavenumber to match padded length.
+        """
+        if wavenumbers.numel() == 0:
+            raise ValueError("wavenumbers must be non-empty.")
+
+        padded_len = num_patches * patch_size
+        if padded_len > wavenumbers.numel():
+            pad_len = padded_len - wavenumbers.numel()
+            pad_val = wavenumbers[-1].expand(pad_len)
+            wavenumbers = torch.cat([wavenumbers, pad_val], dim=0)
+
+        patch_wn = wavenumbers.view(num_patches, patch_size)
+        return patch_wn.mean(dim=1)
+
+    @staticmethod
+    def _build_wavenumber_sincos(
+        wavenumbers: torch.Tensor,
+        d_model: int,
+    ) -> torch.Tensor:
+        """
+        Sinusoidal positional encoding built from absolute wavenumbers.
+        """
+        wn = wavenumbers.float()
+        wn = (wn - wn.mean()) / (wn.std(unbiased=False) + 1e-8)
+
+        half = d_model // 2
+        freq = torch.exp(
+            torch.arange(half, dtype=wn.dtype, device=wn.device)
+            * (-math.log(10000.0) / max(half - 1, 1))
+        )
+        angles = wn.unsqueeze(1) * freq.unsqueeze(0)
+        pe = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)
+
+        if pe.size(1) < d_model:
+            pe = torch.cat([pe, torch.sin(wn).unsqueeze(1)], dim=1)
+
+        return pe[:, :d_model]  # (num_patches, d_model)
+
+    def _patchify(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, L) -> (B, num_patches, patch_size)
+        Right-pad with zeros if L is not divisible by patch_size.
+        """
+        if x.size(-1) != self.input_length:
+            raise ValueError(
+                f"Expected input length {self.input_length}, got {x.size(-1)}."
+            )
+
+        if self.pad_length > 0:
+            x = torch.nn.functional.pad(x, (0, self.pad_length), mode="constant", value=0.0)
+
+        return x.view(x.size(0), self.num_patches, self.patch_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, 1, L) or (B, L)
+        return: (B, n_targets)
+        """
+        if x.dim() == 3:
+            if x.size(1) != 1:
+                raise ValueError(
+                    f"Expected x shape (B, 1, L) when x.dim()==3, got {tuple(x.shape)}"
+                )
+            x = x.squeeze(1)
+        elif x.dim() != 2:
+            raise ValueError(
+                f"Expected x to have shape (B, L) or (B, 1, L), got {tuple(x.shape)}"
+            )
+
+        # 1) Patchify spectral sequence
+        x = self._patchify(x)  # (B, num_patches, patch_size)
+
+        # 2) Linear patch embedding
+        token = self.patch_embed(x)  # (B, num_patches, d_model)
+
+        # 3) Prepend CLS token
+        cls_token = self.cls_token.expand(token.size(0), -1, -1)  # (B, 1, d_model)
+        token = torch.cat([cls_token, token], dim=1)  # (B, 1 + num_patches, d_model)
+
+        # 4) Add positional encoding (learnable for CLS, sinusoidal for patch tokens)
+        pos = torch.cat(
+            [self.cls_positional, self.positional_encoding.unsqueeze(0)],
+            dim=1,
+        )  # (1, 1 + num_patches, d_model)
+        token = token + pos
+        token = self.embed_norm(token)
+        token = self.embed_dropout(token)
+
+        # 5) Transformer blocks
+        h = self.encoder(token)  # (B, 1 + num_patches, d_model)
+
+        # 6) Use CLS output for regression
+        cls_out = h[:, 0, :]  # (B, d_model)
+
+        # 7) Regression head
+        return self.head(cls_out)
+
+
 class SpectralReconstructionMLP(nn.Module):
     """MLP autoencoder for spectrum reconstruction."""
 
@@ -275,9 +674,14 @@ class _BaseSpectralLightningModule(pl.LightningModule):
 
 
 class SpectralRegressionModule(_BaseSpectralLightningModule):
-    """Wraps selectable backbone (CNN/MLP) with training / validation logic."""
+    """Wraps selectable backbone (CNN/MLP/Transformer) with train/val logic."""
 
-    def __init__(self, cfg: Config, input_length: int):
+    def __init__(
+        self,
+        cfg: Config,
+        input_length: int,
+        feature_wavenumbers: Optional[torch.Tensor] = None,
+    ):
         super().__init__()
         self.save_hyperparameters()
         self.cfg = cfg
@@ -288,6 +692,8 @@ class SpectralRegressionModule(_BaseSpectralLightningModule):
             raise ValueError("mlp_group_lasso_lambda must be >= 0.")
         if model_type == "cnn":
             self.model = SpectralCNN(cfg, input_length)
+        elif model_type == "cnn_fourier":
+            self.model = SpectralFourierCNN(cfg, input_length)
         elif model_type == "cnn_dual":
             if not cfg.use_derivative_features:
                 raise ValueError(
@@ -301,10 +707,16 @@ class SpectralRegressionModule(_BaseSpectralLightningModule):
             self.model = SpectralDualBranchCNN(cfg, input_length)
         elif model_type == "mlp":
             self.model = SpectralMLP(cfg, input_length)
+        elif model_type == "transformer":
+            self.model = SpectralTransformer(
+                cfg,
+                input_length,
+                feature_wavenumbers=feature_wavenumbers,
+            )
         else:
             raise ValueError(
                 "Unsupported model_type="
-                f"'{cfg.model_type}'. Use 'cnn', 'cnn_dual', or 'mlp'."
+                f"'{cfg.model_type}'. Use 'cnn', 'cnn_fourier', 'cnn_dual', 'mlp', or 'transformer'."
             )
         self.loss_fn = nn.MSELoss()
         self._val_preds = []

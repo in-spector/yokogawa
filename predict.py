@@ -3,12 +3,23 @@ Generate predictions for the evaluation set using an ensemble of K-fold models.
 
 Usage:
     python predict.py
+    python predict.py --run_dir /home/member/cao/yokogawa/outputs/DS1/20260404_150257
 """
+import argparse
+import glob
+import json
 import os
+import math
 import pickle
+import re
+from datetime import datetime
+from dataclasses import fields
 import numpy as np
 import pandas as pd
 import torch
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from config import Config
 from dataset import (
@@ -22,15 +33,104 @@ from dataset import (
 from model import SpectralRegressionModule
 
 
-def resolve_run_dir(cfg: Config) -> str:
-    """Return run directory to use for checkpoints/predictions."""
-    latest_run_file = os.path.join(cfg.output_dir, "latest_run.txt")
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--run_dir",
+        type=str,
+        default=None,
+        help="Training run directory to load checkpoints/hparams from.",
+    )
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default=None,
+        help="Override data_path used to load train/eval sheets for prediction.",
+    )
+    parser.add_argument(
+        "--train_sheet",
+        type=str,
+        default=None,
+        help="Override train sheet name used for preprocessing fit.",
+    )
+    parser.add_argument(
+        "--eval_sheet",
+        type=str,
+        default=None,
+        help="Override evaluation sheet name used for prediction targets.",
+    )
+    return parser.parse_args()
+
+
+def resolve_run_dir(base_cfg: Config, run_dir_arg: str | None) -> str:
+    """Resolve run directory from arg/config/latest pointer."""
+    if run_dir_arg:
+        run_dir = os.path.abspath(run_dir_arg)
+        if not os.path.isdir(run_dir):
+            raise FileNotFoundError(f"run_dir does not exist: {run_dir}")
+        return run_dir
+
+    config_run_dir = getattr(base_cfg, "predict_run_dir", None)
+    if config_run_dir:
+        run_dir = os.path.abspath(config_run_dir)
+        if not os.path.isdir(run_dir):
+            raise FileNotFoundError(f"predict_run_dir does not exist: {run_dir}")
+        return run_dir
+
+    latest_run_file = os.path.join(base_cfg.output_dir, "latest_run.txt")
     if os.path.exists(latest_run_file):
         with open(latest_run_file) as f:
             run_dir = f.readline().strip()
         if run_dir and os.path.isdir(run_dir):
-            return run_dir
-    return cfg.output_dir
+            return os.path.abspath(run_dir)
+    return os.path.abspath(base_cfg.output_dir)
+
+
+def load_cfg_from_run_hparams(run_dir: str):
+    """Load config values from run artifacts/hparams.json."""
+    hparams_path = os.path.join(run_dir, "artifacts", "hparams.json")
+    if not os.path.isfile(hparams_path):
+        raise FileNotFoundError(f"hparams.json not found: {hparams_path}")
+
+    with open(hparams_path) as f:
+        hparams = json.load(f)
+
+    cfg = Config()
+    valid_keys = {f.name for f in fields(Config)}
+    loaded_keys = []
+    for key, value in hparams.items():
+        if key in valid_keys:
+            setattr(cfg, key, value)
+            loaded_keys.append(key)
+    return cfg, hparams_path, loaded_keys
+
+
+def _fold_sort_key(path: str):
+    """Sort checkpoints by fold index, then filename."""
+    name = os.path.basename(path)
+    match = re.search(r"fold(\d+)_", name)
+    fold = int(match.group(1)) if match else 10**9
+    return (fold, name)
+
+
+def discover_fold_checkpoint_paths(run_dir: str, model_type: str):
+    """Auto-discover fold checkpoints under run_dir/checkpoints."""
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+    if not os.path.isdir(ckpt_dir):
+        raise FileNotFoundError(f"Checkpoint directory not found: {ckpt_dir}")
+
+    if model_type == "pls":
+        pattern = os.path.join(ckpt_dir, "fold*_pls.pkl")
+    else:
+        pattern = os.path.join(ckpt_dir, "fold*_best*.ckpt")
+
+    ckpt_paths = sorted(glob.glob(pattern), key=_fold_sort_key)
+    if not ckpt_paths:
+        raise FileNotFoundError(
+            f"No fold checkpoints found in {ckpt_dir} (pattern={os.path.basename(pattern)})."
+        )
+    return ckpt_paths
 
 
 def _build_feature_wavenumbers(cfg: Config, wavenum: np.ndarray) -> np.ndarray:
@@ -43,16 +143,126 @@ def _build_feature_wavenumbers(cfg: Config, wavenum: np.ndarray) -> np.ndarray:
     return np.concatenate(parts, axis=0).astype(np.float32)
 
 
+def prepare_prediction_artifact_dirs(run_dir: str):
+    """Create a timestamped prediction artifact directory under the run."""
+    predict_root = os.path.join(run_dir, "artifacts", "predict")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(predict_root, timestamp)
+    plots_dir = os.path.join(out_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
+    latest_predict_file = os.path.join(predict_root, "latest_predict.txt")
+    with open(latest_predict_file, "w") as f:
+        f.write(out_dir + "\n")
+
+    return out_dir, plots_dir, latest_predict_file
+
+
+def save_prediction_distribution_plot(
+    result_df: pd.DataFrame,
+    target_cols,
+    out_path: str,
+):
+    """Save per-target prediction distributions as one PDF figure."""
+    n_targets = len(target_cols)
+    if n_targets < 1:
+        return
+
+    n_cols = 1 if n_targets == 1 else 2
+    n_rows = int(math.ceil(n_targets / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 3.8 * n_rows))
+    axes = np.array(axes, dtype=object).reshape(-1)
+
+    for i, name in enumerate(target_cols):
+        ax = axes[i]
+        values = pd.to_numeric(result_df[name], errors="coerce").dropna().to_numpy()
+        if values.size == 0:
+            ax.text(0.5, 0.5, "No valid predictions", ha="center", va="center")
+            ax.set_title(str(name))
+            ax.set_xlabel("Predicted value")
+            ax.set_ylabel("Count")
+            ax.grid(alpha=0.2)
+            continue
+
+        bins = min(40, max(10, int(np.sqrt(values.size))))
+        ax.hist(
+            values,
+            bins=bins,
+            color="#1F77B4",
+            alpha=0.85,
+            edgecolor="white",
+            linewidth=0.6,
+        )
+        mean_v = float(np.mean(values))
+        median_v = float(np.median(values))
+        ax.axvline(mean_v, color="#D62728", lw=1.6, label=f"mean={mean_v:.4g}")
+        ax.axvline(
+            median_v,
+            color="#2CA02C",
+            lw=1.4,
+            ls="--",
+            label=f"median={median_v:.4g}",
+        )
+        ax.set_title(str(name))
+        ax.set_xlabel("Predicted value")
+        ax.set_ylabel("Count")
+        ax.grid(alpha=0.2)
+        ax.legend(loc="best", fontsize=8)
+
+    for j in range(n_targets, len(axes)):
+        axes[j].axis("off")
+
+    fig.suptitle("Prediction distributions on evaluation dataset")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def write_prediction_readme(
+    out_dir: str,
+    predictions_path: str,
+    plot_path: str,
+):
+    """Write a short artifact index for easier navigation."""
+    readme_path = os.path.join(out_dir, "README.txt")
+    lines = [
+        "Prediction artifacts",
+        "",
+        f"- predictions : {os.path.basename(predictions_path)}",
+        f"- plots       : {os.path.relpath(plot_path, out_dir)}",
+        "",
+        "Structure:",
+        f"{os.path.basename(out_dir)}/",
+        f"  {os.path.basename(predictions_path)}",
+        "  plots/",
+        f"    {os.path.basename(plot_path)}",
+    ]
+    with open(readme_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return readme_path
+
+
 def main():
-    cfg = Config()
+    args = parse_args()
+    base_cfg = Config()
+    run_dir = resolve_run_dir(base_cfg, args.run_dir)
+    cfg, hparams_path, loaded_hparams_keys = load_cfg_from_run_hparams(run_dir)
+
+    # Optional command-line overrides for evaluation data source.
+    if args.data_path is not None:
+        cfg.data_path = args.data_path
+    if args.train_sheet is not None:
+        cfg.train_sheet = args.train_sheet
+    if args.eval_sheet is not None:
+        cfg.eval_sheet = args.eval_sheet
+
     model_type = str(cfg.model_type).lower()
     if model_type not in {"cnn", "cnn_fourier", "cnn_dual", "mlp", "transformer", "pls"}:
         raise ValueError(
             f"Unsupported model_type='{cfg.model_type}'. "
             "Use 'cnn', 'cnn_fourier', 'cnn_dual', 'mlp', 'transformer', or 'pls'."
         )
-    os.makedirs(cfg.output_dir, exist_ok=True)
-    run_dir = resolve_run_dir(cfg)
+    os.makedirs(run_dir, exist_ok=True)
 
     # Load and preprocess
     X_raw_all, _, X_eval_raw_all, wavenum_all = load_raw_data(cfg)
@@ -66,12 +276,24 @@ def main():
     input_length = X_train.shape[1]
     feature_wavenumbers = _build_feature_wavenumbers(cfg, wavenum)
 
-    # Load checkpoint paths
-    paths_file = os.path.join(run_dir, "best_checkpoints.txt")
-    with open(paths_file) as f:
-        ckpt_paths = [line.strip() for line in f if line.strip()]
+    # Auto-discover fold checkpoints under run_dir/checkpoints
+    ckpt_paths = discover_fold_checkpoint_paths(run_dir, model_type)
 
     print(f"Ensembling {len(ckpt_paths)} models...")
+    print(f"Run directory: {run_dir}")
+    print(f"Loaded hparams: {hparams_path} ({len(loaded_hparams_keys)} keys)")
+    if any(v is not None for v in [args.data_path, args.train_sheet, args.eval_sheet]):
+        print("CLI overrides:")
+        print(f"  data_path  : {cfg.data_path}")
+        print(f"  train_sheet: {cfg.train_sheet}")
+        print(f"  eval_sheet : {cfg.eval_sheet}")
+    print("Checkpoint paths:")
+    for p in ckpt_paths:
+        print(f"  - {p}")
+    if int(getattr(cfg, "n_splits", 0)) > 0 and len(ckpt_paths) != int(cfg.n_splits):
+        print(
+            f"[WARN] Number of checkpoints ({len(ckpt_paths)}) != n_splits ({cfg.n_splits})."
+        )
 
     preds_list = []
 
@@ -99,27 +321,52 @@ def main():
                 pred = model(X_eval_t.to(model.device)).cpu().numpy()
             preds_list.append(pred)
 
-    # Mean of all fold predictions
-    ensemble_pred = np.mean(preds_list, axis=0)
+    # Aggregate fold predictions per sample/target.
+    # pred_stack shape: (n_folds, n_samples, n_targets)
+    pred_stack = np.stack(preds_list, axis=0)
+    pred_mean = np.mean(pred_stack, axis=0)
+    pred_std = np.std(pred_stack, axis=0)
+    pred_min = np.min(pred_stack, axis=0)
+    pred_max = np.max(pred_stack, axis=0)
 
     # Read evaluation sample IDs (supports merged directory input)
     eval_ids = load_eval_sample_ids(cfg)
-    if len(eval_ids) != ensemble_pred.shape[0]:
+    if len(eval_ids) != pred_mean.shape[0]:
         raise RuntimeError(
             "Mismatch between number of evaluation IDs and predictions: "
-            f"{len(eval_ids)} vs {ensemble_pred.shape[0]}"
+            f"{len(eval_ids)} vs {pred_mean.shape[0]}"
         )
 
     # Build output DataFrame
     result = pd.DataFrame()
     result["SampleID"] = eval_ids
     for i, name in enumerate(cfg.target_cols):
-        result[name] = ensemble_pred[:, i]
+        # Keep legacy mean column name for backward compatibility.
+        result[name] = pred_mean[:, i]
+        result[f"{name}_std"] = pred_std[:, i]
+        result[f"{name}_min"] = pred_min[:, i]
+        result[f"{name}_max"] = pred_max[:, i]
 
-    out_path = os.path.join(run_dir, cfg.predictions_file)
+    predict_out_dir, predict_plots_dir, latest_predict_file = prepare_prediction_artifact_dirs(
+        run_dir
+    )
+    out_path = os.path.join(predict_out_dir, cfg.predictions_file)
+    legacy_out_path = os.path.join(run_dir, cfg.predictions_file)
     result.to_excel(out_path, index=False)
+    # Backward-compatible location used by existing downstream tooling.
+    result.to_excel(legacy_out_path, index=False)
+
+    dist_plot_path = os.path.join(predict_plots_dir, "prediction_distributions.pdf")
+    save_prediction_distribution_plot(result, cfg.target_cols, dist_plot_path)
+    readme_path = write_prediction_readme(predict_out_dir, out_path, dist_plot_path)
+
     print(f"\nUsing run directory: {run_dir}")
+    print(f"Prediction artifact directory: {predict_out_dir}")
     print(f"Predictions saved to {out_path}")
+    print(f"Distribution plot saved to {dist_plot_path}")
+    print(f"Artifact index saved to {readme_path}")
+    print(f"Latest prediction pointer saved to {latest_predict_file}")
+    print(f"Backward-compatible copy saved to {legacy_out_path}")
     print(result.to_string(index=False))
 
 

@@ -12,19 +12,19 @@ class Config:
     # ---- data ----
     data_path: Union[str, List[str]] = field(
         default_factory=lambda: [
-            "/home/member/yokogawa_data/DS6/GX_2009.xlsx"
+            "/home/member/yokogawa_data/DS3"
         ]
     )
     train_sheet: str = "学習用"
     # Optional evaluation sheet. If None, training runs without evaluation-sheet loading.
     eval_sheet: Optional[str] = None
-    target_cols: List[str] = field(default_factory=lambda: ['G1', 'G2', 'G3'])
-    n_targets: int = 3
+    target_cols: List[str] = field(default_factory=lambda: ['H2O'])
+    n_targets: int = 1
 
     # ---- preprocessing ----
     # Savitzky-Golay transform applied to base spectra before feature expansion.
     # Set sg_window to an odd integer (e.g., 23/69). None disables SG.
-    sg_window: int | None = 67
+    sg_window: int | None = 39
     sg_polyorder: int = 2
     # Derivative order for SG: 0=smoothing, 1=first derivative, 2=second derivative
     sg_deriv: int = 1
@@ -61,7 +61,7 @@ class Config:
     # CNN parameters
     # Number of filters per conv block
     cnn_channels: List[int] = field(default_factory=lambda: [32, 64, 128])
-    kernel_size: int = 5
+    kernel_size: int = 3
     dual_kernel_size_raw: int = 7
     dual_kernel_size_derivative: int = 5
     pool_size: int = 4
@@ -111,7 +111,7 @@ class Config:
     init_checkpoint_path: Optional[str] = None  # Optional warm-start checkpoint
     max_epochs: int = 500
     batch_size: int = 32
-    lr: float = 1e-4
+    lr: float = 1e-3
     weight_decay: float = 1e-4
     warmup_epochs: int = 10
     cosine_min_lr: float = 1e-6

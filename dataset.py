@@ -62,63 +62,41 @@ def load_raw_data(cfg: Config):
     eval_sheet = getattr(cfg, "eval_sheet", None)
     use_eval_sheet = bool(eval_sheet)
 
-    train_dfs = []
+    train_records = []
     eval_dfs = []
-    common_cols_all = None
     for file_path in file_paths:
+        train_df = None
+        eval_df = None
+
         try:
             train_df = pd.read_excel(file_path, sheet_name=cfg.train_sheet)
         except Exception as exc:
             print(
-                f"[WARN] Skipped file '{file_path}': {exc}",
+                f"[WARN] Train sheet load failed for '{file_path}': {exc}",
                 file=sys.stderr,
             )
-            continue
-
-        eval_df = None
         if use_eval_sheet:
             try:
                 eval_df = pd.read_excel(file_path, sheet_name=eval_sheet)
             except Exception as exc:
                 print(
-                    f"[WARN] Skipped file '{file_path}': {exc}",
+                    f"[WARN] Eval sheet load failed for '{file_path}': {exc}",
                     file=sys.stderr,
                 )
-                continue
-
-        # Identify spectral columns (numeric column names = wavenumbers)
-        spec_cols = [c for c in train_df.columns if isinstance(c, (int, float))]
-        # Use train-only spectral columns when eval sheet is disabled.
-        # Otherwise, keep only columns common to both train/eval sheets.
-        if use_eval_sheet and eval_df is not None:
-            common_cols = [c for c in spec_cols if c in eval_df.columns]
-        else:
-            common_cols = spec_cols
-        if not common_cols:
-            if use_eval_sheet:
+        if train_df is not None:
+            spec_cols = [c for c in train_df.columns if isinstance(c, (int, float))]
+            if not spec_cols:
                 print(
-                    f"[WARN] Skipped file '{file_path}': no common spectral columns "
-                    f"between '{cfg.train_sheet}' and '{eval_sheet}'",
+                    f"[WARN] Skipped train data in '{file_path}': no spectral columns "
+                    f"in '{cfg.train_sheet}'",
                     file=sys.stderr,
                 )
             else:
-                print(
-                    f"[WARN] Skipped file '{file_path}': no spectral columns in "
-                    f"'{cfg.train_sheet}'",
-                    file=sys.stderr,
-                )
-            continue
-
-        if common_cols_all is None:
-            common_cols_all = set(common_cols)
-        else:
-            common_cols_all &= set(common_cols)
-
-        train_dfs.append((file_path, train_df))
+                train_records.append((file_path, train_df, spec_cols))
         if eval_df is not None:
             eval_dfs.append((file_path, eval_df))
 
-    if not train_dfs:
+    if not train_records:
         raise RuntimeError(
             "No valid Excel files found. "
             + (
@@ -127,11 +105,16 @@ def load_raw_data(cfg: Config):
                 else f"Check train sheet name: train='{cfg.train_sheet}'."
             )
         )
+
+    common_cols_all = set(train_records[0][2])
+    for _, _, spec_cols in train_records[1:]:
+        common_cols_all &= set(spec_cols)
     if not common_cols_all:
-        raise RuntimeError("No common spectral columns across all valid files.")
+        raise RuntimeError("No common spectral columns across all train-sheet files.")
 
     common_cols_sorted = sorted(common_cols_all, reverse=True)  # high wavenumber first
     wavenum = np.array(common_cols_sorted)
+    train_dfs = [(file_path, train_df) for file_path, train_df, _ in train_records]
 
     X_train_parts = []
     y_train_parts = []
@@ -167,6 +150,14 @@ def load_raw_data(cfg: Config):
     if use_eval_sheet and eval_dfs:
         X_eval_parts = []
         for file_path, df in eval_dfs:
+            missing_cols = [c for c in common_cols_sorted if c not in df.columns]
+            if missing_cols:
+                print(
+                    f"[WARN] Skipped eval data in '{file_path}': missing required "
+                    "spectral columns from train-sheet preprocessing.",
+                    file=sys.stderr,
+                )
+                continue
             spec_num, valid = _coerce_numeric_with_valid_mask(df, common_cols_sorted)
             _warn_dropped_rows(
                 file_path,
@@ -214,35 +205,53 @@ def load_eval_sample_ids(cfg: Config) -> np.ndarray:
         return np.array([], dtype=str)
 
     file_paths = resolve_excel_files(cfg.data_path)
+    train_spec_cols_list = []
     eval_dfs = []
-    common_cols_all = None
     for file_path in file_paths:
+        train_df = None
+        eval_df = None
         try:
             train_df = pd.read_excel(file_path, sheet_name=cfg.train_sheet)
+        except Exception as exc:
+            print(
+                f"[WARN] Train sheet load failed for '{file_path}' while loading eval IDs: {exc}",
+                file=sys.stderr,
+            )
+        try:
             eval_df = pd.read_excel(file_path, sheet_name=eval_sheet)
         except Exception as exc:
             print(
-                f"[WARN] Skipped file '{file_path}' while loading eval IDs: {exc}",
+                f"[WARN] Eval sheet load failed for '{file_path}' while loading eval IDs: {exc}",
                 file=sys.stderr,
             )
-            continue
 
-        spec_cols = [c for c in train_df.columns if isinstance(c, (int, float))]
-        common_cols = [c for c in spec_cols if c in eval_df.columns]
-        if not common_cols:
-            continue
-        if common_cols_all is None:
-            common_cols_all = set(common_cols)
-        else:
-            common_cols_all &= set(common_cols)
-        eval_dfs.append((file_path, eval_df))
+        if train_df is not None:
+            spec_cols = [c for c in train_df.columns if isinstance(c, (int, float))]
+            if spec_cols:
+                train_spec_cols_list.append(spec_cols)
+        if eval_df is not None:
+            eval_dfs.append((file_path, eval_df))
 
-    if not eval_dfs or not common_cols_all:
+    if not eval_dfs or not train_spec_cols_list:
+        return np.array([], dtype=str)
+
+    common_cols_all = set(train_spec_cols_list[0])
+    for spec_cols in train_spec_cols_list[1:]:
+        common_cols_all &= set(spec_cols)
+    if not common_cols_all:
         return np.array([], dtype=str)
 
     common_cols_sorted = sorted(common_cols_all, reverse=True)
     ids = []
     for file_path, eval_df in eval_dfs:
+        missing_cols = [c for c in common_cols_sorted if c not in eval_df.columns]
+        if missing_cols:
+            print(
+                f"[WARN] Skipped eval IDs in '{file_path}': missing required spectral "
+                "columns from train-sheet preprocessing.",
+                file=sys.stderr,
+            )
+            continue
         _, valid = _coerce_numeric_with_valid_mask(eval_df, common_cols_sorted)
         _warn_dropped_rows(
             file_path,

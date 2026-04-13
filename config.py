@@ -12,7 +12,7 @@ class Config:
     # ---- data ----
     data_path: Union[str, List[str]] = field(
         default_factory=lambda: [
-            "/home/member/yokogawa_data/DS3"
+            "/home/member/yokogawa_data/DS1/WX_1197.xlsx"
         ]
     )
     train_sheet: str = "学習用"
@@ -24,7 +24,7 @@ class Config:
     # ---- preprocessing ----
     # Savitzky-Golay transform applied to base spectra before feature expansion.
     # Set sg_window to an odd integer (e.g., 23/69). None disables SG.
-    sg_window: int | None = 39
+    sg_window: int | None = 29
     sg_polyorder: int = 2
     # Derivative order for SG: 0=smoothing, 1=first derivative, 2=second derivative
     sg_deriv: int = 1
@@ -39,7 +39,7 @@ class Config:
     std_top_r_percent: Optional[float] = None
     range_plot_n_samples: int = 5
     # Append first-derivative spectra to input features
-    use_derivative_features: bool = False
+    use_derivative_features: bool = True
     # Append second-derivative spectra to input features
     use_second_derivative_features: bool = False
     # Additive-noise data augmentation (regression training only)
@@ -61,7 +61,7 @@ class Config:
     # CNN parameters
     # Number of filters per conv block
     cnn_channels: List[int] = field(default_factory=lambda: [32, 64, 128])
-    kernel_size: int = 3
+    kernel_size: int = 9
     dual_kernel_size_raw: int = 7
     dual_kernel_size_derivative: int = 5
     pool_size: int = 4
@@ -108,10 +108,10 @@ class Config:
     recon_latent_dim: int = 64
 
     # ---- training ----
-    init_checkpoint_path: Optional[str] = None  # Optional warm-start checkpoint
+    init_checkpoint_path: Optional[str] = "/home/member/cao/yokogawa/outputs/DS1/20260412_160831/checkpoints/fold0_best.ckpt"  # Optional warm-start checkpoint
     max_epochs: int = 500
     batch_size: int = 32
-    lr: float = 1e-3
+    lr: float = 1e-4
     weight_decay: float = 1e-4
     warmup_epochs: int = 10
     cosine_min_lr: float = 1e-6
@@ -119,7 +119,7 @@ class Config:
     n_splits: int = 5           # K-fold cross-validation
 
     # ---- output ----
-    output_dir: str = "outputs"
+    output_dir: str = "outputs/DS1"
     tensorboard_dir: str = "tensorboard"
     experiment_name: str = "spectral_regression"
     predictions_file: str = "predictions.xlsx"

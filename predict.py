@@ -29,6 +29,7 @@ from dataset import (
     apply_savgol_to_base_spectra,
     append_derivative_features,
     load_eval_sample_ids,
+    resolve_excel_files,
 )
 from model import SpectralRegressionModule
 
@@ -59,6 +60,20 @@ def parse_args():
         type=str,
         default=None,
         help="Override evaluation sheet name used for prediction targets.",
+    )
+    parser.add_argument(
+        "--save_pred_to_xlsx",
+        action="store_true",
+        help=(
+            "Save a copy of the source xlsx file(s) with prediction columns "
+            "added to the evaluation sheet."
+        ),
+    )
+    parser.add_argument(
+        "--pred_xlsx_suffix",
+        type=str,
+        default="_with_predictions",
+        help="Suffix added to copied xlsx filenames when --save_pred_to_xlsx is used.",
     )
     return parser.parse_args()
 
@@ -242,6 +257,99 @@ def write_prediction_readme(
     return readme_path
 
 
+def _get_common_train_spec_cols(cfg: Config):
+    """Collect train-sheet spectral columns shared across all valid source files."""
+    file_paths = resolve_excel_files(cfg.data_path)
+    train_spec_cols_list = []
+
+    for file_path in file_paths:
+        try:
+            train_df = pd.read_excel(file_path, sheet_name=cfg.train_sheet)
+        except Exception as exc:
+            print(f"[WARN] Train sheet load failed for '{file_path}': {exc}")
+            continue
+
+        spec_cols = [c for c in train_df.columns if isinstance(c, (int, float))]
+        if spec_cols:
+            train_spec_cols_list.append(spec_cols)
+
+    if not train_spec_cols_list:
+        raise RuntimeError("No valid train-sheet spectral columns found for XLSX export.")
+
+    common_cols = set(train_spec_cols_list[0])
+    for spec_cols in train_spec_cols_list[1:]:
+        common_cols &= set(spec_cols)
+    if not common_cols:
+        raise RuntimeError("No common spectral columns found for XLSX export.")
+
+    return sorted(common_cols, reverse=True)
+
+
+def save_predictions_to_source_xlsx(
+    cfg: Config,
+    pred_mean: np.ndarray,
+    suffix: str,
+):
+    """Save copied xlsx files with prediction columns added to eval_sheet."""
+    eval_sheet = getattr(cfg, "eval_sheet", None)
+    if not eval_sheet:
+        raise ValueError("--save_pred_to_xlsx requires eval_sheet to be set.")
+
+    file_paths = resolve_excel_files(cfg.data_path)
+    common_spec_cols = _get_common_train_spec_cols(cfg)
+    pred_offset = 0
+    saved_paths = []
+
+    for file_path in file_paths:
+        all_sheets = pd.read_excel(file_path, sheet_name=None)
+        eval_df = all_sheets.get(eval_sheet)
+        if eval_df is None:
+            print(f"[WARN] Eval sheet '{eval_sheet}' not found in '{file_path}'. Skipped.")
+            continue
+
+        missing_cols = [c for c in common_spec_cols if c not in eval_df.columns]
+        if missing_cols:
+            print(
+                f"[WARN] Eval sheet in '{file_path}' is missing required spectral columns. Skipped."
+            )
+            continue
+
+        valid_mask = ~eval_df.loc[:, common_spec_cols].apply(
+            pd.to_numeric, errors="coerce"
+        ).isna().any(axis=1)
+        valid_index = eval_df.index[valid_mask]
+        n_valid = len(valid_index)
+        next_offset = pred_offset + n_valid
+        if next_offset > pred_mean.shape[0]:
+            raise RuntimeError(
+                f"Prediction row count is insufficient for '{file_path}': "
+                f"need {next_offset}, got {pred_mean.shape[0]}."
+            )
+
+        updated_eval_df = eval_df.copy()
+        for i, name in enumerate(cfg.target_cols):
+            updated_eval_df[name] = np.nan
+            updated_eval_df.loc[valid_index, name] = pred_mean[pred_offset:next_offset, i]
+        all_sheets[eval_sheet] = updated_eval_df
+
+        root, ext = os.path.splitext(str(file_path))
+        out_path = f"{root}{suffix}{ext}"
+        with pd.ExcelWriter(out_path) as writer:
+            for sheet_name, sheet_df in all_sheets.items():
+                sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        saved_paths.append(out_path)
+        pred_offset = next_offset
+
+    if pred_offset != pred_mean.shape[0]:
+        raise RuntimeError(
+            "Not all predictions were written back to source xlsx files: "
+            f"used {pred_offset}, total {pred_mean.shape[0]}."
+        )
+
+    return saved_paths
+
+
 def main():
     args = parse_args()
     base_cfg = Config()
@@ -367,6 +475,15 @@ def main():
     print(f"Artifact index saved to {readme_path}")
     print(f"Latest prediction pointer saved to {latest_predict_file}")
     print(f"Backward-compatible copy saved to {legacy_out_path}")
+    if args.save_pred_to_xlsx:
+        saved_xlsx_paths = save_predictions_to_source_xlsx(
+            cfg,
+            pred_mean=pred_mean,
+            suffix=args.pred_xlsx_suffix,
+        )
+        print("Prediction-added xlsx files:")
+        for path in saved_xlsx_paths:
+            print(f"  - {path}")
     print(result.to_string(index=False))
 
 
